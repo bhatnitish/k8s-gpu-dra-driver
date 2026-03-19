@@ -12,6 +12,12 @@ on:
       - main
       - 'release-v*'
 
+# Serialize auto-tag + build per branch to prevent tag race conditions.
+# If two merges happen back-to-back, the second waits for the first to finish.
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # Auto-tag and build/push on merge (push events only)
   auto-tag:
@@ -34,6 +40,7 @@ jobs:
       image-tag: ${{ needs.auto-tag.outputs.tag }}
       push: true
       env-registry: DRIVER_IMAGE_REGISTRY
+      env-name: DRIVER_IMAGE_NAME
       env-tag: DRIVER_IMAGE_TAG
     secrets:
       registry-username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -52,4 +59,5 @@ jobs:
       image-tag: pr-${{ github.event.pull_request.number }}
       push: false
       env-registry: DRIVER_IMAGE_REGISTRY
+      env-name: DRIVER_IMAGE_NAME
       env-tag: DRIVER_IMAGE_TAG
