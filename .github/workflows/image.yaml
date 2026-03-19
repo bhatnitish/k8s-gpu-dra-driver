@@ -6,6 +6,7 @@ on:
       - develop
       - 'release-v*'
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     branches:
       - develop
       - main
