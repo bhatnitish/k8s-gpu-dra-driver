@@ -1,0 +1,54 @@
+name: Image
+
+on:
+  push:
+    branches:
+      - develop
+      - 'release-v*'
+  pull_request:
+    branches:
+      - develop
+      - main
+      - 'release-v*'
+
+jobs:
+  # Auto-tag and build/push on merge (push events only)
+  auto-tag:
+    name: Auto Tag
+    if: github.event_name == 'push'
+    uses: bhatnitish/ci-workflows/.github/workflows/auto-tag.yaml@main
+    with:
+      branch-type: ${{ startsWith(github.ref, 'refs/heads/release-v') && 'release' || 'develop' }}
+    permissions:
+      contents: write
+
+  build-push:
+    name: Build & Push
+    needs: auto-tag
+    if: github.event_name == 'push'
+    uses: bhatnitish/ci-workflows/.github/workflows/image-build-push.yaml@main
+    with:
+      image-registry: docker.io/bhatnitish
+      image-name: k8s-gpu-dra-driver
+      image-tag: ${{ needs.auto-tag.outputs.tag }}
+      push: true
+      env-registry: DRIVER_IMAGE_REGISTRY
+      env-tag: DRIVER_IMAGE_TAG
+    secrets:
+      registry-username: ${{ secrets.DOCKERHUB_USERNAME }}
+      registry-password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  # Label-gated image build on PRs (build only, no push)
+  pr-build:
+    name: PR Build
+    if: >-
+      github.event_name == 'pull_request' &&
+      contains(github.event.pull_request.labels.*.name, 'ci-run')
+    uses: bhatnitish/ci-workflows/.github/workflows/image-build-push.yaml@main
+    with:
+      image-registry: docker.io/bhatnitish
+      image-name: k8s-gpu-dra-driver
+      image-tag: pr-${{ github.event.pull_request.number }}
+      push: false
+      env-registry: DRIVER_IMAGE_REGISTRY
+      env-tag: DRIVER_IMAGE_TAG
