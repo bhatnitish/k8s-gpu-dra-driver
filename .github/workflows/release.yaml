@@ -16,6 +16,7 @@ jobs:
       image-tag: ${{ github.ref_name }}
       push: true
       env-registry: DRIVER_IMAGE_REGISTRY
+      env-name: DRIVER_IMAGE_NAME
       env-tag: DRIVER_IMAGE_TAG
     secrets:
       registry-username: ${{ secrets.DOCKERHUB_USERNAME }}
