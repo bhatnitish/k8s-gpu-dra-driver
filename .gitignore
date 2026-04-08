@@ -3,5 +3,5 @@
 helm-charts-k8s/*.tgz
 
 # Binaries
-gpu-kubeletplugin
-webhook
+/gpu-kubeletplugin
+/webhook
