@@ -17,6 +17,7 @@ allocation requests.
 | `--kubelet-registrar-directory-path` | string | `/var/lib/kubelet/plugins_registry` | `KUBELET_REGISTRAR_DIRECTORY_PATH` | Absolute path to the directory where kubelet stores plugin registrations. |
 | `--kubelet-plugins-directory-path` | string | `/var/lib/kubelet/plugins` | `KUBELET_PLUGINS_DIRECTORY_PATH` | Absolute path to the directory where kubelet stores plugin data. |
 | `--healthcheck-port` | int | `-1` | `HEALTHCHECK_PORT` | Port for the gRPC healthcheck service. A positive value uses that port, `0` allocates a random port, and a negative value disables the service. |
+| `--enable-auto-partition` | bool | `false` | `ENABLE_AUTO_PARTITION` | **[Beta]** Enable auto-partition mode. When enabled, the driver advertises all possible compute+memory partition configurations as virtual devices and dynamically partitions GPUs on demand via AMD SMI when a ResourceClaim is prepared. Requires Kubernetes 1.36+ with DRA beta features. GPUs that do not support partitioning are unaffected. |
 
 ### Kubernetes client flags
 

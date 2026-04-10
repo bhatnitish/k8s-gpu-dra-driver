@@ -193,7 +193,7 @@ selectors:
       expression: 'device.attributes["gpu.amd.com"].numaNode == 0'
 ```
 
-## Auto-partition mode (virtual partition devices)
+## Auto-partition mode (virtual partition devices) [Beta]
 
 When auto-partition is enabled (`--enable-auto-partition` flag or
 `ENABLE_AUTO_PARTITION=true` environment variable), the driver advertises
