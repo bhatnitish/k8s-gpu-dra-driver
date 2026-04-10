@@ -62,10 +62,81 @@ DOCKER_TARGETS := $(patsubst %,docker-%, $(TARGETS))
 
 GOOS ?= linux
 
+# Exclude the libamdsmi submodule from Go tooling by giving it its own go.mod.
+# This prevents go list/test/vet from treating it as part of our module.
+# Same approach as the DCM repo.
+.PHONY: exclude-submodules
+exclude-submodules:
+	@if [ -d $(CURDIR)/libamdsmi ] && [ ! -f $(CURDIR)/libamdsmi/go.mod ]; then \
+		echo "module github.com/ROCm/amdsmi" > $(CURDIR)/libamdsmi/go.mod; \
+	fi
+
+# ---------------------------------------------------------------------------
+# Pre-compiled AMD SMI assets for CGo (libamd_smi, header, libdrm)
+# ---------------------------------------------------------------------------
+AMDSMI_ASSETS_SRC ?= $(CURDIR)/assets/amd_smi_lib/x86_64/RHEL9/lib
+
+.PHONY: copy-assets
+copy-assets:
+	@if [ -f $(CURDIR)/build/assets/amd_smi/amdsmi.h ] && [ -e $(CURDIR)/build/assets/libamd_smi.so ]; then \
+		echo "AMD SMI assets already present, skipping copy"; \
+	else \
+		mkdir -p $(CURDIR)/build/assets/amd_smi; \
+		cp $(AMDSMI_ASSETS_SRC)/amdsmi.h $(CURDIR)/build/assets/amd_smi/; \
+		cp $(AMDSMI_ASSETS_SRC)/libamd_smi.so* $(CURDIR)/build/assets/; \
+		cd $(CURDIR)/build/assets && \
+			if [ ! -e libamd_smi.so ]; then \
+				ln -sf $$(ls libamd_smi.so.* | head -1) libamd_smi.so; \
+			fi; \
+		cp $(AMDSMI_ASSETS_SRC)/libdrm_amdgpu.so* $(CURDIR)/build/assets/; \
+		cp $(AMDSMI_ASSETS_SRC)/libdrm.so* $(CURDIR)/build/assets/; \
+		echo "AMD SMI assets copied from $(AMDSMI_ASSETS_SRC)"; \
+	fi
+
+# ---------------------------------------------------------------------------
+# AMD SMI library build from source
+# ---------------------------------------------------------------------------
+AMDSMI_BRANCH ?= rocm-7.2.1
+AMDSMI_COMMIT ?= 1e91f3c1527617066f50c22f9ec4368fe82e1a3c
+AMDSMI_BUILDER_IMAGE ?= amdsmi-builder-dra:rhel9
+AMDSMI_BASE_IMAGE ?= registry.access.redhat.com/ubi9/ubi:9.4
+SMILIB_CONTAINER_WORKDIR := /usr/src/github.com/ROCm/k8s-gpu-dra-driver/
+AMDSMI_BUILD_DIR := $(CURDIR)/tools/smilib-builderimage
+
+# Build the Docker builder image for compiling libamd_smi from source
+.PHONY: amdsmi-build-rhel
+amdsmi-build-rhel:
+	@echo "Building amdsmi builder image: $(AMDSMI_BUILDER_IMAGE)"
+	@docker image rm $(AMDSMI_BUILDER_IMAGE) || true
+	@docker build --build-arg BUILD_BASE_IMAGE=$(AMDSMI_BASE_IMAGE) \
+		-t $(AMDSMI_BUILDER_IMAGE) . -f $(AMDSMI_BUILD_DIR)/Dockerfile.rhel9.4
+
+# Compile libamd_smi from the libamdsmi submodule using the builder image
+.PHONY: amdsmi-compile-rhel
+amdsmi-compile-rhel:
+	@echo "Compiling amdsmi library using $(AMDSMI_BUILDER_IMAGE)"
+	@docker run --rm -it --privileged \
+		-e "USER_NAME=$(shell whoami)" \
+		-e "USER_UID=$(shell id -u)" \
+		-e "USER_GID=$(shell id -g)" \
+		-e "BRANCH=$(AMDSMI_BRANCH)" \
+		-e "COMMIT=$(AMDSMI_COMMIT)" \
+		--name smibuild -v $(CURDIR):$(SMILIB_CONTAINER_WORKDIR) \
+		-w $(SMILIB_CONTAINER_WORKDIR) $(AMDSMI_BUILDER_IMAGE)
+	@echo "Copying amdsmi assets to assets/amd_smi_lib/x86_64/RHEL9/lib/"
+	@mkdir -p $(CURDIR)/assets/amd_smi_lib/x86_64/RHEL9/lib/
+	@cp -rvf $(CURDIR)/libamdsmi/build/dcmout/* $(CURDIR)/assets/amd_smi_lib/x86_64/RHEL9/lib/
+
+# Convenience target: build builder image + compile
+.PHONY: amdsmi-update
+amdsmi-update:
+	@echo "Updating amdsmi libs from branch $(AMDSMI_BRANCH) and commit $(AMDSMI_COMMIT)"
+	$(MAKE) amdsmi-build-rhel amdsmi-compile-rhel
+
 ifneq ($(PREFIX),)
 cmd-%: COMMAND_BUILD_OPTIONS = -o $(PREFIX)/$(*)
 endif
-cmds: $(CMD_TARGETS)
+cmds: copy-assets exclude-submodules $(CMD_TARGETS)
 $(CMD_TARGETS): cmd-%:
 	CGO_LDFLAGS_ALLOW='-Wl,--unresolved-symbols=ignore-in-object-files' GOOS=$(GOOS) \
 		go build -ldflags "-s -w -X main.version=$(VERSION)" $(COMMAND_BUILD_OPTIONS) $(MODULE)/cmd/$(*)
@@ -75,18 +146,18 @@ build:
 	@bash scripts/build-driver-image.sh
 
 all: build helm
-check: $(CHECK_TARGETS)
+check: exclude-submodules $(CHECK_TARGETS)
 
 # Update the vendor folder
 vendor:
 	go mod vendor
 
 # Apply go fmt to the codebase
-fmt:
+fmt: exclude-submodules
 	go list -f '{{.Dir}}' $(MODULE)/... \
 		| xargs gofmt -s -l -w
 
-assert-fmt:
+assert-fmt: exclude-submodules
 	go list -f '{{.Dir}}' $(MODULE)/... \
 		| xargs gofmt -s -l > fmt.out
 	@if [ -s fmt.out ]; then \
@@ -98,18 +169,19 @@ assert-fmt:
 		rm fmt.out; \
 	fi
 
-ineffassign:
+ineffassign: exclude-submodules
 	ineffassign $(MODULE)/...
 
-lint:
+lint: exclude-submodules
 	golangci-lint run ./...
 
-vet:
+vet: exclude-submodules
 	go vet $(MODULE)/...
 
 COVERAGE_FILE := coverage.out
-test:
-	go test -v -coverprofile=$(COVERAGE_FILE) $(MODULE)/...
+test: copy-assets exclude-submodules
+	LD_LIBRARY_PATH=$(CURDIR)/build/assets:$$LD_LIBRARY_PATH \
+		go test -v -coverprofile=$(COVERAGE_FILE) $(MODULE)/...
 
 coverage: test
 	cat $(COVERAGE_FILE) | grep -v "_mock.go" > $(COVERAGE_FILE).no-mocks

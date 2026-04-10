@@ -55,10 +55,14 @@ LABEL description="See summary"
 
 COPY LICENSE LICENSE
 
-RUN microdnf clean all && \
-    microdnf update -y && \
-    microdnf install -y gcc gcc-c++ make pkgconfig libdrm && \
+RUN microdnf update -y && \
+    microdnf install -y libdrm && \
     microdnf clean all
+
+# Copy the pre-compiled AMD SMI library for runtime linking
+COPY --from=build /build/build/assets/libamd_smi.so* /usr/lib64/
 
 COPY --from=build /artifacts/gpu-kubeletplugin /usr/bin/gpu-kubeletplugin
 COPY --from=build /artifacts/webhook           /usr/bin/webhook
+
+ENV LD_LIBRARY_PATH=/usr/lib64

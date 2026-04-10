@@ -46,32 +46,50 @@ import (
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	klog "k8s.io/klog/v2"
 
+	"github.com/ROCm/k8s-gpu-dra-driver/pkg/amdsmi"
 	"github.com/ROCm/k8s-gpu-dra-driver/pkg/consts"
 )
 
 type driver struct {
-	client      coreclientset.Interface
-	helper      *kubeletplugin.Helper
-	state       *DeviceState
-	healthcheck *healthcheck
-	cancelCtx   func(error)
+	client                   coreclientset.Interface
+	helper                   *kubeletplugin.Helper
+	state                    *DeviceState
+	healthcheck              *healthcheck
+	cancelCtx                func(error)
+	enableSyntheticPartition bool
+	nodeName                 string
+	partitionableGPUs        []int
 }
 
 func NewDriver(ctx context.Context, config *Config) (*driver, error) {
-	driver := &driver{
-		client:    config.coreclient,
-		cancelCtx: config.cancelMainCtx,
+	d := &driver{
+		client:                   config.coreclient,
+		cancelCtx:                config.cancelMainCtx,
+		enableSyntheticPartition: config.flags.enableSyntheticPartition,
+		nodeName:                 config.flags.nodeName,
 	}
 
 	state, err := NewDeviceState(config)
 	if err != nil {
 		return nil, err
 	}
-	driver.state = state
+	d.state = state
+
+	// Copy partitionable GPU indices from partition state for counter set building
+	if state.partitionState != nil {
+		d.partitionableGPUs = state.partitionState.partitionableGPUs
+	}
+
+	// Initialize AMD SMI library for GPU partition operations
+	if config.flags.enableSyntheticPartition {
+		if err := amdsmi.Init(); err != nil {
+			return nil, fmt.Errorf("failed to initialize AMD SMI: %v", err)
+		}
+	}
 
 	helper, err := kubeletplugin.Start(
 		ctx,
-		driver,
+		d,
 		kubeletplugin.KubeClient(config.coreclient),
 		kubeletplugin.NodeName(config.flags.nodeName),
 		kubeletplugin.DriverName(consts.DriverName),
@@ -81,25 +99,35 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 	if err != nil {
 		return nil, err
 	}
-	driver.helper = helper
+	d.helper = helper
+	// Store helper reference in state for re-publishing from Prepare/Unprepare
+	d.state.driver = d
 
-	devices := make([]resourceapi.Device, 0, len(state.allocatable))
-	for device := range maps.Values(state.allocatable) {
-		devices = append(devices, device.GetDevice())
-	}
-	resources := resourceslice.DriverResources{
-		Pools: map[string]resourceslice.Pool{
-			config.flags.nodeName: {
-				Slices: []resourceslice.Slice{
-					{
-						Devices: devices,
+	var resources resourceslice.DriverResources
+
+	if config.flags.enableSyntheticPartition && d.state.partitionState != nil {
+		// Synthetic-partition mode: build two slices (shared counters + devices)
+		resources = d.buildSyntheticPartitionResources()
+	} else {
+		// Standard mode: single slice with all devices
+		devices := make([]resourceapi.Device, 0, len(state.allocatable))
+		for device := range maps.Values(state.allocatable) {
+			devices = append(devices, device.GetDevice())
+		}
+		resources = resourceslice.DriverResources{
+			Pools: map[string]resourceslice.Pool{
+				config.flags.nodeName: {
+					Slices: []resourceslice.Slice{
+						{
+							Devices: devices,
+						},
 					},
 				},
 			},
-		},
+		}
 	}
 
-	driver.healthcheck, err = startHealthcheck(ctx, config)
+	d.healthcheck, err = startHealthcheck(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("start healthcheck: %w", err)
 	}
@@ -108,12 +136,66 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 		return nil, err
 	}
 
-	return driver, nil
+	return d, nil
+}
+
+// buildSyntheticPartitionResources builds DriverResources for synthetic-partition mode.
+// Counter sets and devices are placed in separate slices within the same pool.
+// The API requires that a ResourceSlice contains either sharedCounters or devices, not both.
+func (d *driver) buildSyntheticPartitionResources() resourceslice.DriverResources {
+	// Build counter sets for partitionable GPUs
+	counterSets := make([]resourceapi.CounterSet, 0, len(d.partitionableGPUs))
+	for _, gpuIndex := range d.partitionableGPUs {
+		counterSets = append(counterSets, buildMutexCounterSet(gpuIndex))
+	}
+
+	// Build device list
+	devices := make([]resourceapi.Device, 0, len(d.state.allocatable))
+	for device := range maps.Values(d.state.allocatable) {
+		devices = append(devices, device.GetDevice())
+	}
+
+	// Use separate slices: one for shared counters, one for devices.
+	slices := []resourceslice.Slice{
+		{Devices: devices},
+	}
+	if len(counterSets) > 0 {
+		slices = append(slices, resourceslice.Slice{
+			SharedCounters: counterSets,
+		})
+	}
+
+	return resourceslice.DriverResources{
+		Pools: map[string]resourceslice.Pool{
+			d.nodeName: {
+				Slices: slices,
+			},
+		},
+	}
+}
+
+// republishResources re-publishes ResourceSlices with updated taints.
+// Called from Prepare (to add memory partition conflict taints) and
+// Unprepare (to remove taints when all allocations are released).
+func (d *driver) republishResources(ctx context.Context) error {
+	if !d.enableSyntheticPartition || d.state.partitionState == nil {
+		return nil
+	}
+
+	resources := d.buildSyntheticPartitionResources()
+	if err := d.helper.PublishResources(ctx, resources); err != nil {
+		return fmt.Errorf("error re-publishing resources: %v", err)
+	}
+	klog.Infof("Re-published ResourceSlices with updated taints")
+	return nil
 }
 
 func (d *driver) Shutdown(logger klog.Logger) error {
 	if d.healthcheck != nil {
 		d.healthcheck.Stop(logger)
+	}
+	if d.enableSyntheticPartition {
+		amdsmi.Shutdown()
 	}
 	d.helper.Stop()
 	return nil

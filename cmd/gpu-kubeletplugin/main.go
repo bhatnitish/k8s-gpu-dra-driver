@@ -64,6 +64,7 @@ type Flags struct {
 	kubeletRegistrarDirectoryPath string
 	kubeletPluginsDirectoryPath   string
 	healthcheckPort               int
+	enableSyntheticPartition      bool
 }
 
 type Config struct {
@@ -122,6 +123,13 @@ func newApp() *cli.App {
 			Value:       -1,
 			Destination: &flags.healthcheckPort,
 			EnvVars:     []string{"HEALTHCHECK_PORT"},
+		},
+		&cli.BoolFlag{
+			Name:        "enable-auto-partition",
+			Usage:       "Enable auto-partition mode: advertise all possible partition configurations as devices and dynamically partition GPUs on-demand via amd-smi. Requires Kubernetes 1.36+ with DRA beta features enabled.",
+			Value:       false,
+			Destination: &flags.enableSyntheticPartition,
+			EnvVars:     []string{"ENABLE_AUTO_PARTITION"},
 		},
 	}
 	cliFlags = append(cliFlags, flags.kubeClientConfig.Flags()...)

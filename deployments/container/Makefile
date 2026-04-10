@@ -42,6 +42,15 @@ IMAGE ?= $(DRIVER_IMAGE_REGISTRY)/$(DRIVER_IMAGE_NAME):$(DRIVER_IMAGE_TAG)
 
 ubi-minimal-9.6: BASE_IMAGE = registry.access.redhat.com/ubi9/ubi-minimal:9.6
 
+# Ensure pre-compiled AMD SMI assets are available in the build context
+# before running docker build, since the sibling DCM repo is not part
+# of the Docker context.
+$(DISTRIBUTIONS): copy-assets-host
+
+.PHONY: copy-assets-host
+copy-assets-host:
+	$(MAKE) -C $(CURDIR) copy-assets
+
 # Use a generic build target to build the relevant images
 $(DISTRIBUTIONS):
 	@echo "Building image: $(IMAGE) using base image: $(BASE_IMAGE)"

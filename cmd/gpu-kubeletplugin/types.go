@@ -17,9 +17,10 @@ limitations under the License.
 package main
 
 const (
-	AmdGpuDeviceType       = "amdgpu"
-	AmdPartitionDeviceType = "amdgpu-partition"
-	UnknownDeviceType      = "unknown"
+	AmdGpuDeviceType             = "amdgpu"
+	AmdPartitionDeviceType       = "amdgpu-partition"
+	SyntheticPartitionDeviceType = "amdgpu-synthetic-partition"
+	UnknownDeviceType            = "unknown"
 )
 
 type UUIDProvider interface {
