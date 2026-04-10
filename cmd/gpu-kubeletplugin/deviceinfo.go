@@ -276,20 +276,38 @@ func (d *SyntheticPartitionDevice) GetDevice() resourceapi.Device {
 		}
 	}
 
+	// Build capacity entries for memory, computeUnits, simdUnits.
+	// d.MemoryBytes/ComputeUnits/SimdUnits are per-partition values.
+	// Value = total for device (per-partition * count), Default = per-partition.
+	memoryCapacity := resourceapi.DeviceCapacity{
+		Value: *resource.NewQuantity(int64(d.MemoryBytes)*int64(d.PartitionCount), resource.BinarySI),
+	}
+	computeUnitsCapacity := resourceapi.DeviceCapacity{
+		Value: *resource.NewQuantity(int64(d.ComputeUnits)*int64(d.PartitionCount), resource.DecimalSI),
+	}
+	simdUnitsCapacity := resourceapi.DeviceCapacity{
+		Value: *resource.NewQuantity(int64(d.SimdUnits)*int64(d.PartitionCount), resource.DecimalSI),
+	}
+	if d.PartitionCount > 1 {
+		memoryCapacity.RequestPolicy = &resourceapi.CapacityRequestPolicy{
+			Default: resource.NewQuantity(int64(d.MemoryBytes), resource.BinarySI),
+		}
+		computeUnitsCapacity.RequestPolicy = &resourceapi.CapacityRequestPolicy{
+			Default: resource.NewQuantity(int64(d.ComputeUnits), resource.DecimalSI),
+		}
+		simdUnitsCapacity.RequestPolicy = &resourceapi.CapacityRequestPolicy{
+			Default: resource.NewQuantity(int64(d.SimdUnits), resource.DecimalSI),
+		}
+	}
+
 	device := resourceapi.Device{
 		Name:       d.CanonicalName(),
 		Attributes: attributes,
 		Capacity: map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
-			"partitions": partitionsCapacity,
-			"memory": {
-				Value: *resource.NewQuantity(int64(d.MemoryBytes), resource.BinarySI),
-			},
-			"computeUnits": {
-				Value: *resource.NewQuantity(int64(d.ComputeUnits), resource.BinarySI),
-			},
-			"simdUnits": {
-				Value: *resource.NewQuantity(int64(d.SimdUnits), resource.BinarySI),
-			},
+			"partitions":   partitionsCapacity,
+			"memory":       memoryCapacity,
+			"computeUnits": computeUnitsCapacity,
+			"simdUnits":    simdUnitsCapacity,
 		},
 		ConsumesCounters: []resourceapi.DeviceCounterConsumption{
 			{
