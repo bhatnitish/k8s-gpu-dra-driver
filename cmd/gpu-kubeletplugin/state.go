@@ -33,6 +33,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"slices"
@@ -40,6 +41,7 @@ import (
 	"syscall"
 
 	configapi "github.com/ROCm/k8s-gpu-dra-driver/api/amd.com/resource/gpu/v1alpha1"
+	"github.com/ROCm/k8s-gpu-dra-driver/pkg/amdgpu"
 	"github.com/ROCm/k8s-gpu-dra-driver/pkg/consts"
 	"golang.org/x/sys/unix"
 	resourceapi "k8s.io/api/resource/v1"
@@ -76,13 +78,20 @@ func (pds PreparedDevices) GetDevices() []*drapbv1.Device {
 
 type DeviceState struct {
 	sync.Mutex
-	cdi               *CDIHandler
-	allocatable       AllocatableDevices
-	checkpointManager checkpointmanager.CheckpointManager
+	cdi                      *CDIHandler
+	allocatable              AllocatableDevices
+	checkpointManager        checkpointmanager.CheckpointManager
+	partitionState           *PartitionState
+	driver                   *driver
+	syntheticPartition       bool
+	partitionableGPUs        []int
+	gpuPCIAddresses          map[int]string
 }
 
 func NewDeviceState(config *Config) (*DeviceState, error) {
-	allocatable, err := enumerateAllPossibleDevices()
+	enableSyntheticPartition := config.flags.enableSyntheticPartition
+
+	allocatable, gpuPCIAddresses, partitionableGPUs, err := enumerateAllPossibleDevices(enableSyntheticPartition)
 	if err != nil {
 		return nil, fmt.Errorf("error enumerating all possible devices: %v", err)
 	}
@@ -103,9 +112,17 @@ func NewDeviceState(config *Config) (*DeviceState, error) {
 	}
 
 	state := &DeviceState{
-		cdi:               cdi,
-		allocatable:       allocatable,
-		checkpointManager: checkpointManager,
+		cdi:                cdi,
+		allocatable:        allocatable,
+		checkpointManager:  checkpointManager,
+		syntheticPartition: enableSyntheticPartition,
+		partitionableGPUs:  partitionableGPUs,
+		gpuPCIAddresses:    gpuPCIAddresses,
+	}
+
+	// Initialize partition state for auto-partition mode
+	if enableSyntheticPartition {
+		state.partitionState = NewPartitionState(gpuPCIAddresses, partitionableGPUs, allocatable)
 	}
 
 	checkpoints, err := state.checkpointManager.ListCheckpoints()
@@ -115,6 +132,19 @@ func NewDeviceState(config *Config) (*DeviceState, error) {
 
 	for _, c := range checkpoints {
 		if c == DriverPluginCheckpointFile {
+			// Restore partition state from checkpoint if available
+			if enableSyntheticPartition {
+				checkpoint := newCheckpoint()
+				if err := state.checkpointManager.GetCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
+					klog.Warningf("Failed to load checkpoint for partition state restore: %v", err)
+				} else if checkpoint.V1 != nil {
+					state.partitionState.RecoverFromCheckpoint(
+						checkpoint.V1.ActiveMemoryMode,
+						checkpoint.V1.GPUComputeModes,
+						checkpoint.V1.PreparedClaims,
+					)
+				}
+			}
 			return state, nil
 		}
 	}
@@ -143,6 +173,21 @@ func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]*drapbv1.Devi
 		return preparedClaims[claimUID].GetDevices(), nil
 	}
 
+	// In auto-partition mode, apply partition changes before preparing devices
+	if s.syntheticPartition && claim.Status.Allocation != nil {
+		for _, result := range claim.Status.Allocation.Devices.Results {
+			device, exists := s.allocatable[result.Device]
+			if !exists {
+				continue
+			}
+			if device.Type() == SyntheticPartitionDeviceType {
+				if err := s.partitionState.PreparePartition(result.Device); err != nil {
+					return nil, fmt.Errorf("failed to prepare partition for device %s: %v", result.Device, err)
+				}
+			}
+		}
+	}
+
 	preparedDevices, err := s.prepareDevices(claim)
 	if err != nil {
 		return nil, fmt.Errorf("prepare failed: %v", err)
@@ -153,8 +198,22 @@ func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]*drapbv1.Devi
 	}
 
 	preparedClaims[claimUID] = preparedDevices
+
+	// Checkpoint partition state along with prepared claims
+	if s.syntheticPartition && s.partitionState != nil {
+		checkpoint.V1.ActiveMemoryMode = s.partitionState.GetActiveMemoryMode()
+		checkpoint.V1.GPUComputeModes = s.partitionState.GetGPUComputeModes()
+	}
+
 	if err := s.checkpointManager.CreateCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
 		return nil, fmt.Errorf("unable to sync to checkpoint: %v", err)
+	}
+
+	// Re-publish resources if partition taints changed (e.g., memory mode locked)
+	if s.syntheticPartition && s.partitionState != nil && s.partitionState.HasTaints() && s.driver != nil {
+		if err := s.driver.republishResources(context.TODO()); err != nil {
+			klog.Warningf("Failed to re-publish resources after partition prepare: %v", err)
+		}
 	}
 
 	return preparedClaims[claimUID].GetDevices(), nil
@@ -174,6 +233,27 @@ func (s *DeviceState) Unprepare(claimUID string) error {
 		return nil
 	}
 
+	// In auto-partition mode, release partition on the GPU being freed
+	taintsChanged := false
+	if s.syntheticPartition && s.partitionState != nil {
+		for _, pd := range preparedClaims[claimUID] {
+			deviceName := pd.DeviceName
+			device, exists := s.allocatable[deviceName]
+			if !exists {
+				continue
+			}
+			if device.Type() == SyntheticPartitionDeviceType {
+				changed, err := s.partitionState.UnpreparePartition(deviceName)
+				if err != nil {
+					klog.Warningf("Failed to unprepare partition for device %s: %v", deviceName, err)
+				}
+				if changed {
+					taintsChanged = true
+				}
+			}
+		}
+	}
+
 	if err := s.unprepareDevices(claimUID, preparedClaims[claimUID]); err != nil {
 		return fmt.Errorf("unprepare failed: %v", err)
 	}
@@ -184,8 +264,22 @@ func (s *DeviceState) Unprepare(claimUID string) error {
 	}
 
 	delete(preparedClaims, claimUID)
+
+	// Checkpoint partition state along with prepared claims
+	if s.syntheticPartition && s.partitionState != nil {
+		checkpoint.V1.ActiveMemoryMode = s.partitionState.GetActiveMemoryMode()
+		checkpoint.V1.GPUComputeModes = s.partitionState.GetGPUComputeModes()
+	}
+
 	if err := s.checkpointManager.CreateCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
 		return fmt.Errorf("unable to sync to checkpoint: %v", err)
+	}
+
+	// Re-publish resources if memory taints changed (e.g., all allocations released)
+	if taintsChanged && s.driver != nil {
+		if err := s.driver.republishResources(context.TODO()); err != nil {
+			klog.Warningf("Failed to re-publish resources after taint change: %v", err)
+		}
 	}
 
 	return nil
@@ -327,17 +421,25 @@ func (s *DeviceState) applyConfig(config *configapi.GpuConfig, results []*resour
 
 	for _, result := range results {
 		klog.Infof("received allocation result: %+v", result)
+
+		// Check if this is a synthetic partition device
+		device, exists := s.allocatable[result.Device]
+		if exists && device.Type() == SyntheticPartitionDeviceType {
+			// For synthetic partition devices, discover device nodes after partitioning
+			sp := device.SyntheticPartition
+			edits, err := s.discoverPartitionDeviceNodes(sp)
+			if err != nil {
+				return nil, fmt.Errorf("error discovering partition device nodes for %s: %w", result.Device, err)
+			}
+			perDeviceEdits[result.Device] = edits
+			continue
+		}
+
+		// Standard device path: parse card/renderD from device name
 		card, renderD, err := parseDeviceName(result.Device)
 		if err != nil {
 			return nil, fmt.Errorf("error parsing device name %s: %w", result.Device, err)
 		}
-		// TODO implement GPU sharing config when it is available
-		//switch {
-		//case config.Sharing.IsTimeSlicing():
-		//	// TODO implement time slicing config when it is available
-		//case config.Sharing.IsSpacePartitioning():
-		//	// TODO implement space partitioning config when it is available
-		//}
 
 		cardPath := fmt.Sprintf("/dev/dri/card%d", card)
 		renderDPath := fmt.Sprintf("/dev/dri/renderD%d", renderD)
@@ -389,6 +491,106 @@ func (s *DeviceState) applyConfig(config *configapi.GpuConfig, results []*resour
 	}
 
 	return perDeviceEdits, nil
+}
+
+// discoverPartitionDeviceNodes discovers the actual /dev/dri/card* and /dev/dri/renderD*
+// device nodes for a synthetic partition device after the GPU has been repartitioned.
+// After a partition change, the GPU may expose multiple card/renderD pairs through XCP
+// platform devices. This method re-enumerates the GPU's devices and returns CDI container
+// edits for all partition device nodes belonging to this GPU.
+func (s *DeviceState) discoverPartitionDeviceNodes(sp *SyntheticPartitionDevice) (*cdiapi.ContainerEdits, error) {
+	pciAddr := sp.PCIAddress
+	partitionCount := sp.PartitionCount
+
+	klog.Infof("Discovering partition device nodes for GPU %d (PCI %s, %d partitions)",
+		sp.GPUIndex, pciAddr, partitionCount)
+
+	// Re-enumerate GPUs to find the current device nodes after partitioning
+	allGPUs := amdgpu.GetAMDGPUs()
+
+	var deviceNodes []*cdispec.DeviceNode
+
+	// Add /dev/kfd (always needed)
+	kfdPath := "/dev/kfd"
+	kfdMajor, kfdMinor, kfdDevType, kfdPermission, err := s.getDeviceAttrs(kfdPath)
+	if err != nil {
+		return nil, fmt.Errorf("error getting device attrs for %s: %w", kfdPath, err)
+	}
+	deviceNodes = append(deviceNodes, &cdispec.DeviceNode{
+		Path:        kfdPath,
+		HostPath:    kfdPath,
+		Type:        kfdDevType,
+		Major:       kfdMajor,
+		Minor:       kfdMinor,
+		Permissions: kfdPermission,
+	})
+
+	// Find all device entries that belong to this GPU's PCI address
+	found := 0
+	for entryPCI, gpuInfoMap := range allGPUs {
+		// Match by PCI address (XCP partitions share the same PCI address as parent)
+		kfdID, _ := gpuInfoMap["kfdID"].(string)
+		entryPCIAddr, _ := gpuInfoMap["pciAddr"].(string)
+
+		// Match either by direct PCI address or by kfdID
+		if entryPCIAddr != pciAddr && entryPCI != pciAddr && kfdID != pciAddr {
+			continue
+		}
+
+		card, ok := gpuInfoMap["card"].(int)
+		if !ok {
+			continue
+		}
+		renderD, ok := gpuInfoMap["renderD"].(int)
+		if !ok {
+			continue
+		}
+
+		cardPath := fmt.Sprintf("/dev/dri/card%d", card)
+		renderDPath := fmt.Sprintf("/dev/dri/renderD%d", renderD)
+
+		cardMajor, cardMinor, cardDevType, cardPermission, err := s.getDeviceAttrs(cardPath)
+		if err != nil {
+			klog.Warningf("Failed to get device attrs for %s: %v, skipping", cardPath, err)
+			continue
+		}
+		renderDMajor, renderDMinor, renderDDevType, renderDPermission, err := s.getDeviceAttrs(renderDPath)
+		if err != nil {
+			klog.Warningf("Failed to get device attrs for %s: %v, skipping", renderDPath, err)
+			continue
+		}
+
+		deviceNodes = append(deviceNodes, &cdispec.DeviceNode{
+			Path:        cardPath,
+			HostPath:    cardPath,
+			Type:        cardDevType,
+			Major:       cardMajor,
+			Minor:       cardMinor,
+			Permissions: cardPermission,
+		})
+		deviceNodes = append(deviceNodes, &cdispec.DeviceNode{
+			Path:        renderDPath,
+			HostPath:    renderDPath,
+			Type:        renderDDevType,
+			Major:       renderDMajor,
+			Minor:       renderDMinor,
+			Permissions: renderDPermission,
+		})
+
+		found++
+		klog.Infof("Found partition device node: card%d, renderD%d for GPU %d", card, renderD, sp.GPUIndex)
+	}
+
+	if found == 0 {
+		return nil, fmt.Errorf("no device nodes found for GPU %d (PCI %s) after partitioning", sp.GPUIndex, pciAddr)
+	}
+
+	klog.Infof("Discovered %d partition device node pairs for GPU %d", found, sp.GPUIndex)
+
+	edits := &cdispec.ContainerEdits{
+		DeviceNodes: deviceNodes,
+	}
+	return &cdiapi.ContainerEdits{ContainerEdits: edits}, nil
 }
 
 // GetOpaqueDeviceConfigs returns an ordered list of the configs contained in possibleConfigs for this driver.

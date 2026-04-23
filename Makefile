@@ -62,10 +62,40 @@ DOCKER_TARGETS := $(patsubst %,docker-%, $(TARGETS))
 
 GOOS ?= linux
 
+# Exclude the libamdsmi submodule from Go tooling by giving it its own go.mod.
+# This prevents go list/test/vet from treating it as part of our module.
+.PHONY: exclude-submodules
+exclude-submodules:
+	@if [ -d $(CURDIR)/libamdsmi ] && [ ! -f $(CURDIR)/libamdsmi/go.mod ]; then \
+		echo "module github.com/ROCm/amdsmi" > $(CURDIR)/libamdsmi/go.mod; \
+	fi
+
+# ---------------------------------------------------------------------------
+# Pre-compiled AMD SMI assets for CGo (libamd_smi, header, libdrm)
+# ---------------------------------------------------------------------------
+AMDSMI_ASSETS_SRC ?= $(CURDIR)/assets/amd_smi_lib/x86_64/RHEL9/lib
+
+.PHONY: copy-assets
+copy-assets:
+	@if [ -f $(CURDIR)/build/assets/amd_smi/amdsmi.h ] && [ -e $(CURDIR)/build/assets/libamd_smi.so ]; then \
+		echo "AMD SMI assets already present, skipping copy"; \
+	else \
+		mkdir -p $(CURDIR)/build/assets/amd_smi; \
+		cp $(AMDSMI_ASSETS_SRC)/amdsmi.h $(CURDIR)/build/assets/amd_smi/; \
+		cp $(AMDSMI_ASSETS_SRC)/libamd_smi.so* $(CURDIR)/build/assets/; \
+		cd $(CURDIR)/build/assets && \
+			if [ ! -e libamd_smi.so ]; then \
+				ln -sf $$(ls libamd_smi.so.* | head -1) libamd_smi.so; \
+			fi; \
+		cp $(AMDSMI_ASSETS_SRC)/libdrm_amdgpu.so* $(CURDIR)/build/assets/; \
+		cp $(AMDSMI_ASSETS_SRC)/libdrm.so* $(CURDIR)/build/assets/; \
+		echo "AMD SMI assets copied from $(AMDSMI_ASSETS_SRC)"; \
+	fi
+
 ifneq ($(PREFIX),)
 cmd-%: COMMAND_BUILD_OPTIONS = -o $(PREFIX)/$(*)
 endif
-cmds: $(CMD_TARGETS)
+cmds: copy-assets exclude-submodules $(CMD_TARGETS)
 $(CMD_TARGETS): cmd-%:
 	CGO_LDFLAGS_ALLOW='-Wl,--unresolved-symbols=ignore-in-object-files' GOOS=$(GOOS) \
 		go build -ldflags "-s -w -X main.version=$(VERSION)" $(COMMAND_BUILD_OPTIONS) $(MODULE)/cmd/$(*)
@@ -75,18 +105,18 @@ build:
 	@bash scripts/build-driver-image.sh
 
 all: build helm
-check: $(CHECK_TARGETS)
+check: exclude-submodules $(CHECK_TARGETS)
 
 # Update the vendor folder
 vendor:
 	go mod vendor
 
 # Apply go fmt to the codebase
-fmt:
+fmt: exclude-submodules
 	go list -f '{{.Dir}}' $(MODULE)/... \
 		| xargs gofmt -s -l -w
 
-assert-fmt:
+assert-fmt: exclude-submodules
 	go list -f '{{.Dir}}' $(MODULE)/... \
 		| xargs gofmt -s -l > fmt.out
 	@if [ -s fmt.out ]; then \
@@ -101,15 +131,16 @@ assert-fmt:
 ineffassign:
 	ineffassign $(MODULE)/...
 
-lint:
+lint: exclude-submodules
 	golangci-lint run ./...
 
-vet:
+vet: exclude-submodules
 	go vet $(MODULE)/...
 
 COVERAGE_FILE := coverage.out
-test:
-	go test -v -coverprofile=$(COVERAGE_FILE) $(MODULE)/...
+test: copy-assets exclude-submodules
+	LD_LIBRARY_PATH=$(CURDIR)/build/assets:$$LD_LIBRARY_PATH \
+		go test -v -coverprofile=$(COVERAGE_FILE) $(MODULE)/...
 
 coverage: test
 	cat $(COVERAGE_FILE) | grep -v "_mock.go" > $(COVERAGE_FILE).no-mocks

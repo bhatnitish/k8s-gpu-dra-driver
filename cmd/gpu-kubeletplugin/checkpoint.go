@@ -43,7 +43,9 @@ type Checkpoint struct {
 }
 
 type CheckpointV1 struct {
-	PreparedClaims PreparedClaims `json:"preparedClaims,omitempty"`
+	PreparedClaims   PreparedClaims `json:"preparedClaims,omitempty"`
+	ActiveMemoryMode string         `json:"activeMemoryMode,omitempty"`
+	GPUComputeModes  map[int]string `json:"gpuComputeModes,omitempty"`
 }
 
 func newCheckpoint() *Checkpoint {

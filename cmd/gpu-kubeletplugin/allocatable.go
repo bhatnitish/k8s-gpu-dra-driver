@@ -25,19 +25,23 @@ import (
 // AllocatableDevices represents a collection of allocatable devices mapped by their canonical names
 type AllocatableDevices map[string]*AllocatableDevice
 
-// AllocatableDevice wraps either a full AMD GPU or a partition
+// AllocatableDevice wraps either a full AMD GPU, a partition, or a synthetic partition device
 type AllocatableDevice struct {
-	AmdGpu       *AmdGpuInfo
-	AmdPartition *AmdPartitionInfo
+	AmdGpu             *AmdGpuInfo
+	AmdPartition       *AmdPartitionInfo
+	SyntheticPartition *SyntheticPartitionDevice
 }
 
-// Type returns the device type (amdgpu or amdgpu-partition)
+// Type returns the device type (amdgpu, amdgpu-partition, or amdgpu-synthetic-partition)
 func (d *AllocatableDevice) Type() string {
 	if d.AmdGpu != nil {
 		return AmdGpuDeviceType
 	}
 	if d.AmdPartition != nil {
 		return AmdPartitionDeviceType
+	}
+	if d.SyntheticPartition != nil {
+		return SyntheticPartitionDeviceType
 	}
 	return UnknownDeviceType
 }
@@ -49,6 +53,8 @@ func (d *AllocatableDevice) CanonicalName() string {
 		return d.AmdGpu.CanonicalName()
 	case AmdPartitionDeviceType:
 		return d.AmdPartition.CanonicalName()
+	case SyntheticPartitionDeviceType:
+		return d.SyntheticPartition.CanonicalName()
 	}
 	panic(fmt.Sprintf("unexpected device type: %s", d.Type()))
 }
@@ -60,6 +66,8 @@ func (d *AllocatableDevice) GetDevice() resourceapi.Device {
 		return d.AmdGpu.GetDevice()
 	case AmdPartitionDeviceType:
 		return d.AmdPartition.GetDevice()
+	case SyntheticPartitionDeviceType:
+		return d.SyntheticPartition.GetDevice()
 	}
 	panic(fmt.Sprintf("unexpected device type: %s", d.Type()))
 }

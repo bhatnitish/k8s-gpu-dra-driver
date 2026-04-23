@@ -34,9 +34,11 @@ package main
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/ROCm/k8s-gpu-dra-driver/pkg/amdgpu"
 	"github.com/ROCm/k8s-gpu-dra-driver/pkg/consts"
+	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/dynamic-resource-allocation/deviceattribute"
 	klog "k8s.io/klog/v2"
 )
@@ -84,9 +86,15 @@ func getPcieInfo(gpuInfoMap map[string]interface{}) (deviceattribute.DeviceAttri
 	return pcieRootAttr, pciBusIDAttr, pciAddr, nil
 }
 
-func enumerateAllPossibleDevices() (AllocatableDevices, error) {
+func enumerateAllPossibleDevices(enableSyntheticPartition bool) (AllocatableDevices, map[int]string, []int, error) {
 	alldevices := make(AllocatableDevices)
 	allAMDGPUs := amdgpu.GetAMDGPUs()
+	gpuPCIAddresses := make(map[int]string)
+	var partitionableGPUs []int
+
+	if enableSyntheticPartition {
+		return enumerateSyntheticPartitionDevices(allAMDGPUs, alldevices, gpuPCIAddresses, partitionableGPUs)
+	}
 
 	for pciAddr, gpuInfoMap := range allAMDGPUs {
 		// Get PCIe root attribute for this device using the PCI address from the device info
@@ -175,5 +183,134 @@ func enumerateAllPossibleDevices() (AllocatableDevices, error) {
 	}
 
 	klog.Infof("Discovered %d AMD GPU devices", len(alldevices))
-	return alldevices, nil
+	return alldevices, gpuPCIAddresses, partitionableGPUs, nil
+}
+
+// enumerateSyntheticPartitionDevices generates virtual SyntheticPartitionDevice entries
+// for all valid compute+memory partition combinations on partitionable GPUs.
+// Non-partitionable GPUs are advertised as normal full GPUs.
+func enumerateSyntheticPartitionDevices(
+	allAMDGPUs map[string]map[string]interface{},
+	alldevices AllocatableDevices,
+	gpuPCIAddresses map[int]string,
+	partitionableGPUs []int,
+) (AllocatableDevices, map[int]string, []int, error) {
+
+	// Sort PCI addresses for deterministic GPU index assignment
+	pciAddresses := make([]string, 0, len(allAMDGPUs))
+	for pciAddr := range allAMDGPUs {
+		pciAddresses = append(pciAddresses, pciAddr)
+	}
+	sort.Strings(pciAddresses)
+
+	// Build a map from kfdID to GPU index for deduplication
+	// (partitioned GPUs appear multiple times with same kfdID)
+	kfdIDToIndex := make(map[string]int)
+	gpuIndex := 0
+
+	for _, pciAddr := range pciAddresses {
+		gpuInfoMap := allAMDGPUs[pciAddr]
+
+		kfdID := gpuInfoMap["kfdID"].(string)
+
+		// Skip duplicate entries (same physical GPU seen through multiple XCP partitions)
+		if _, exists := kfdIDToIndex[kfdID]; exists {
+			continue
+		}
+		kfdIDToIndex[kfdID] = gpuIndex
+
+		computePartitionType := gpuInfoMap["computePartitionType"].(string)
+		memoryPartitionType := gpuInfoMap["memoryPartitionType"].(string)
+
+		pcieRootAttr, pciBusIDAttr, _, err := getPcieInfo(gpuInfoMap)
+		if err != nil {
+			klog.Warning(err.Error())
+		}
+
+		simdUnits, computeUnits := extractTopologyInfo(gpuInfoMap)
+		totalMemory := getMemoryBytes(gpuInfoMap, 80*1024*1024*1024, "device", pciAddr)
+		driverVersion := gpuInfoMap["driverVersion"].(string)
+		productName := gpuInfoMap["productName"].(string)
+		deviceID := gpuInfoMap["deviceID"].(string)
+		numaNode := gpuInfoMap["numaNode"].(int)
+
+		gpuPCIAddresses[gpuIndex] = pciAddr
+
+		// Check if GPU supports partitioning
+		isPartitionable := computePartitionType != ""
+
+		if !isPartitionable {
+			// Non-partitionable GPU: advertise as normal full GPU
+			amdGpuInfo := &AmdGpuInfo{
+				PCIAddress:    pciAddr,
+				cardIndex:     gpuInfoMap["card"].(int),
+				renderIndex:   gpuInfoMap["renderD"].(int),
+				KFDID:         kfdID,
+				DeviceID:      deviceID,
+				DriverVersion: driverVersion,
+				ProductName:   productName,
+				pcieRootAttr:  pcieRootAttr,
+				pciBusIDAttr:  pciBusIDAttr,
+				SimdUnits:     simdUnits,
+				ComputeUnits:  computeUnits,
+				NumaNode:      numaNode,
+				MemoryBytes:   totalMemory,
+			}
+
+			device := &AllocatableDevice{AmdGpu: amdGpuInfo}
+			alldevices[device.CanonicalName()] = device
+
+			klog.Infof("Found non-partitionable AMD GPU: %s (index %d), compute type: %s, memory type: %s",
+				device.CanonicalName(), gpuIndex, computePartitionType, memoryPartitionType)
+		} else {
+			// Partitionable GPU: generate synthetic devices for each valid config
+			partitionableGPUs = append(partitionableGPUs, gpuIndex)
+
+			for _, config := range consts.ValidPartitionConfigs {
+				// Calculate per-partition resources based on partition count
+				partitionMemory := totalMemory / uint64(config.PartitionCount)
+				partitionCUs := computeUnits / config.PartitionCount
+				partitionSIMDs := simdUnits / config.PartitionCount
+
+				// Build taints for non-default memory modes
+				var taints []resourceapi.DeviceTaint
+				if config.MemoryMode != consts.MemoryPartitionNPS1 {
+					taints = append(taints, resourceapi.DeviceTaint{
+						Key:    consts.MemoryPartitionTaintKey,
+						Value:  config.MemoryMode,
+						Effect: resourceapi.DeviceTaintEffectNoSchedule,
+					})
+				}
+
+				syntheticDevice := &SyntheticPartitionDevice{
+					GPUIndex:         gpuIndex,
+					ComputePartition: config.ComputeMode,
+					MemoryPartition:  config.MemoryMode,
+					PartitionCount:   config.PartitionCount,
+					PCIAddress:       pciAddr,
+					ProductName:      productName,
+					DeviceID:         deviceID,
+					DriverVersion:    driverVersion,
+					MemoryBytes:      partitionMemory,
+					ComputeUnits:     partitionCUs,
+					SimdUnits:        partitionSIMDs,
+					NumaNode:         numaNode,
+					pcieRootAttr:     pcieRootAttr,
+					pciBusIDAttr:     pciBusIDAttr,
+					Taints:           taints,
+				}
+
+				device := &AllocatableDevice{SyntheticPartition: syntheticDevice}
+				alldevices[device.CanonicalName()] = device
+
+				klog.Infof("Generated synthetic partition device: %s (GPU %d, %s_%s, %d partitions)",
+					device.CanonicalName(), gpuIndex, config.ComputeMode, config.MemoryMode, config.PartitionCount)
+			}
+		}
+
+		gpuIndex++
+	}
+
+	klog.Infof("Discovered %d AMD GPU devices (%d partitionable GPUs)", len(alldevices), len(partitionableGPUs))
+	return alldevices, gpuPCIAddresses, partitionableGPUs, nil
 }

@@ -26,6 +26,13 @@ serviceAccount:
   name: ""
 
 kubeletPlugin:
+  # Enable auto-partition mode: advertise all possible partition configurations
+  # (compute + memory mode combinations) as virtual devices and dynamically
+  # partition GPUs on-demand via amd-smi when a ResourceClaim is prepared.
+  # Requires Kubernetes 1.36+ with DRA beta features enabled.
+  # GPUs that do not support partitioning are advertised as normal devices
+  # regardless of this setting.
+  enableAutoPartition: false
   priorityClassName: "system-node-critical"
   updateStrategy:
     type: RollingUpdate

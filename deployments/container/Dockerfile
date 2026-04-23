@@ -34,8 +34,10 @@ FROM golang:${GOLANG_VERSION} as build
 WORKDIR /build
 COPY . .
 
-ENV CGO_ENABLED=0
-RUN mkdir /artifacts && \
+RUN apt-get update && \
+    apt-get install build-essential pkg-config libdrm-dev -y && \
+    rm -rf /var/lib/apt/lists/* && \
+    mkdir /artifacts && \
     make PREFIX=/artifacts cmds
 
 FROM ${BASE_IMAGE}
@@ -53,9 +55,14 @@ LABEL description="See summary"
 
 COPY LICENSE LICENSE
 
-RUN microdnf clean all && \
-    microdnf update -y && \
+RUN microdnf update -y && \
+    microdnf install -y libdrm && \
     microdnf clean all
+
+# Copy the pre-compiled AMD SMI library for runtime linking
+COPY --from=build /build/build/assets/libamd_smi.so* /usr/lib64/
 
 COPY --from=build /artifacts/gpu-kubeletplugin /usr/bin/gpu-kubeletplugin
 COPY --from=build /artifacts/webhook           /usr/bin/webhook
+
+ENV LD_LIBRARY_PATH=/usr/lib64
